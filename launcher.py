@@ -2,6 +2,7 @@ import sys
 import os
 import subprocess
 import configparser
+import importlib.util
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QLabel, QProgressBar, QMessageBox, QPushButton)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -9,6 +10,19 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 class DependencyInstaller(QThread):
     progress = pyqtSignal(str) # Log message
     finished = pyqtSignal(bool) # Success/Fail
+
+    IMPORT_MAP = {
+        "PyQt6": "PyQt6",
+        "faster-whisper": "faster_whisper",
+        "sounddevice": "sounddevice",
+        "numpy": "numpy",
+        "openai": "openai",
+        "pyobjc-framework-CoreAudio": "CoreAudio",
+        "funasr": "funasr",
+        "modelscope": "modelscope",
+        "watchdog": "watchdog",
+        "mlx-whisper": "mlx_whisper",
+    }
 
     def run(self):
         self.progress.emit("Checking dependencies...")
@@ -24,14 +38,19 @@ class DependencyInstaller(QThread):
 
         missing = []
         for pkg in required_packages:
-            # Simple check: try to import the package name usually maps to the install name
-            # But some don't (e.g. pyqt6 -> PyQt6).
-            # So we rely on pip freeze or just try to install everything?
-            # Better approach: Just run pip install and let it skip existing.
-            pass
-            
-        # We will just run pip install -r requirements.txt
-        # This is safer than guessing import names.
+            requirement = pkg.split(";")[0].strip()
+            package_name = requirement.split("[")[0].split("==")[0].split(">=")[0].split("<=")[0].strip()
+            module_name = self.IMPORT_MAP.get(package_name, package_name.replace("-", "_"))
+            try:
+                if importlib.util.find_spec(module_name) is None:
+                    missing.append(pkg)
+            except Exception:
+                missing.append(pkg)
+
+        if not missing:
+            self.progress.emit("Dependencies already installed.")
+            self.finished.emit(True)
+            return
         
         self.progress.emit("Installing/Verifying dependencies via pip...")
         

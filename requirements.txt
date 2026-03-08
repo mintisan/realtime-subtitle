@@ -1,5 +1,6 @@
 PyQt6
 faster-whisper
+mlx-whisper; sys_platform == 'darwin'
 sounddevice
 numpy
 openai

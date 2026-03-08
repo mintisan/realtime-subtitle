@@ -24,6 +24,11 @@ class Pipeline(QObject):
         super().__init__()
         self.signals = WorkerSignals()
         self.running = True
+        self.state_lock = threading.Lock()
+        self.partial_future = None
+        self.last_final_text = ""
+        self.active_chunk_id = 1
+        self.latest_partial_request = 0
         
         # Print config for debugging
         config.print_config()
@@ -58,6 +63,24 @@ class Pipeline(QObject):
             compute_type=config.whisper_compute_type,
             language=config.source_language
         )
+        self.live_transcriber = self.transcriber
+        self.has_dedicated_live_transcriber = False
+        
+        # Keep live partial updates responsive by using a separate Whisper instance.
+        if config.asr_backend == "whisper":
+            try:
+                print("[Pipeline] Initializing dedicated live transcriber for partial updates...")
+                self.live_transcriber = Transcriber(
+                    backend=config.asr_backend,
+                    model_size=model_size,
+                    device=config.whisper_device,
+                    compute_type=config.whisper_compute_type,
+                    language=config.source_language
+                )
+                self.has_dedicated_live_transcriber = True
+            except Exception as e:
+                print(f"[Pipeline] Live transcriber unavailable, reusing final transcriber: {e}")
+                self.live_transcriber = self.transcriber
         
         # Initialize Translator
         print(f"[Pipeline] Initializing Translator (target={config.target_lang})...")
@@ -70,6 +93,8 @@ class Pipeline(QObject):
         
         # Warmup Transcriber (Critical for MLX/GPU)
         self.transcriber.warmup()
+        if self.live_transcriber is not self.transcriber:
+            self.live_transcriber.warmup()
 
     def start(self):
         """Start the processing pipeline in a dedicated thread"""
@@ -88,43 +113,17 @@ class Pipeline(QObject):
 
     def processing_loop(self):
         """Fully parallel pipeline: multiple concurrent transcription + translation"""
-        print("Pipeline processing loop started (FULLY PARALLEL mode).")
-        
-        # Create multiple transcribers for concurrent processing
-        # CHECK: If using MLX, force 1 worker (MLX is not thread-safe for parallel inference in this way)
-        is_mlx = (config.asr_backend == "mlx")
-        
-        if is_mlx:
-            print("[Pipeline] MLX backend detected - forcing single worker (MLX uses GPU parallelism internaly)")
-            num_transcription_workers = 1
-        else:
-            num_transcription_workers = config.transcription_workers
-            
-        print(f"[Pipeline] Using {num_transcription_workers} transcription workers...")
-        
-        # Determine model size based on backend
-        if config.asr_backend == "funasr":
-            model_size = config.funasr_model
-        else:
-            model_size = config.whisper_model
-        
-        transcribers = [self.transcriber]  # Reuse existing one
-        for i in range(num_transcription_workers - 1):
-            t = Transcriber(
-                backend=config.asr_backend,
-                model_size=model_size,
-                device=config.whisper_device,
-                compute_type=config.whisper_compute_type,
-                language=config.source_language
-            )
-            transcribers.append(t)
-        """Accumulating Buffer Processing Loop (Word-by-Word Streaming)"""
-        print("[Pipeline] processing loop started (Accumulating Mode).")
+        print("Pipeline processing loop started.")
+        if self.has_dedicated_live_transcriber:
+            print("[Pipeline] Using a dedicated live transcriber for partial updates.")
         
         import numpy as np
         
         # Executors
-        transcribe_executor = ThreadPoolExecutor(max_workers=1) # Serial transcription
+        partial_executor = ThreadPoolExecutor(max_workers=1)
+        final_executor = partial_executor
+        if self.live_transcriber is not self.transcriber:
+            final_executor = ThreadPoolExecutor(max_workers=1)
         translate_executor = ThreadPoolExecutor(max_workers=config.translation_threads)
         
         # State
@@ -136,8 +135,7 @@ class Pipeline(QObject):
         # Generator yielding small chunks (e.g. 0.2s)
         audio_gen = self.audio.generator()
         
-        # Context Management
-        self.last_final_text = ""
+        overlap_samples = int(self.audio.sample_rate * config.final_overlap_duration)
 
         try:
             for audio_chunk in audio_gen:
@@ -182,6 +180,9 @@ class Pipeline(QObject):
                 if should_finalize and buffer_duration > 0.5:
                     # FINALIZE
                     final_buffer = buffer.copy()
+                    next_buffer = np.array([], dtype=np.float32)
+                    if overlap_samples > 0 and len(final_buffer) > overlap_samples:
+                        next_buffer = final_buffer[-overlap_samples:].copy()
                     cid = chunk_id
                     
                     # Store current prompt to pass to task (thread safety)
@@ -195,11 +196,14 @@ class Pipeline(QObject):
                     else:
                         # Submit Final Task
                         # Pass prompt AND translate_executor for async translation
-                        transcribe_executor.submit(self._process_final_chunk, final_buffer, cid, prompt, translate_executor)
+                        final_executor.submit(self._process_final_chunk, final_buffer, cid, prompt, translate_executor)
                     
                     # Reset
-                    buffer = np.array([], dtype=np.float32)
+                    buffer = next_buffer
                     chunk_id += 1
+                    with self.state_lock:
+                        self.active_chunk_id = chunk_id
+                        self.latest_partial_request += 1
                     phrase_start_time = now
                     last_update_time = now
                     
@@ -211,22 +215,34 @@ class Pipeline(QObject):
                     
                     # RMS Check to avoid partial hallucination on silence
                     rms = np.sqrt(np.mean(partial_buffer**2))
-                    if rms > self.audio.silence_threshold:
-                        transcribe_executor.submit(self._process_partial_chunk, partial_buffer, chunk_id, prompt)
+                    if rms > self.audio.silence_threshold and (self.partial_future is None or self.partial_future.done()):
+                        with self.state_lock:
+                            self.active_chunk_id = chunk_id
+                            self.latest_partial_request += 1
+                            request_id = self.latest_partial_request
+                        self.partial_future = partial_executor.submit(
+                            self._process_partial_chunk, partial_buffer, chunk_id, prompt, request_id
+                        )
                     
                     last_update_time = now
                     
         except Exception as e:
             print(f"[Pipeline] Error in loop: {e}")
         finally:
-            transcribe_executor.shutdown(wait=False)
+            partial_executor.shutdown(wait=False)
+            if final_executor is not partial_executor:
+                final_executor.shutdown(wait=False)
             translate_executor.shutdown(wait=False)
 
-    def _process_partial_chunk(self, audio_data, chunk_id, prompt=""):
+    def _process_partial_chunk(self, audio_data, chunk_id, prompt="", request_id=0):
         """Transcribe and update UI (No translation)"""
         try:
             # Use accumulated context as prompt
-            text = self.transcriber.transcribe(audio_data, prompt=prompt)
+            text = self.live_transcriber.transcribe(audio_data, prompt=prompt)
+            with self.state_lock:
+                is_stale = request_id != self.latest_partial_request or chunk_id != self.active_chunk_id
+            if is_stale:
+                return
             if text:
                 self.signals.update_text.emit(chunk_id, text, "")
         except Exception as e:
@@ -240,7 +256,7 @@ class Pipeline(QObject):
                 print(f"[Final {chunk_id}] Transcribed: {text}")
                 # Save for context (only if meaningful)
                 if len(text.split()) > 2:
-                    self.last_final_text = text
+                    self.last_final_text = self._trim_prompt_context(text)
                 
                 # Emit final transcription first (confirms text)
                 self.signals.update_text.emit(chunk_id, text, "(translating...)")
@@ -262,6 +278,13 @@ class Pipeline(QObject):
         except Exception as e:
             print(f"[Translation {chunk_id}] Failed: {e}")
             self.signals.update_text.emit(chunk_id, text, "[Translation Failed]")
+
+    def _trim_prompt_context(self, text, max_words=20):
+        """Keep prompt context short so carry-over helps continuity without over-biasing."""
+        words = text.split()
+        if len(words) <= max_words:
+            return text
+        return " ".join(words[-max_words:])
     
     def _transcribe_chunk(self, transcriber, audio_chunk, chunk_id):
         """Transcribe a single chunk and log timing"""

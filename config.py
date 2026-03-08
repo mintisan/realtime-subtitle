@@ -1,5 +1,6 @@
 import configparser
 import os
+from api_utils import normalize_openai_base_url
 
 class Config:
     """Centralized configuration loaded from config.ini"""
@@ -18,7 +19,9 @@ class Config:
             print(f"[Config] Warning: {config_path} not found, using defaults/env vars")
         
         # API settings (env vars take precedence)
-        self.api_base_url = os.getenv("OPENAI_BASE_URL") or self._get("api", "base_url") or None
+        self.api_base_url = normalize_openai_base_url(
+            os.getenv("OPENAI_BASE_URL") or self._get("api", "base_url") or None
+        )
         self.api_key = os.getenv("OPENAI_API_KEY") or self._get("api", "api_key", "dummy-key-for-local")
         
         # Translation settings
@@ -62,6 +65,7 @@ class Config:
         self.streaming_step_size = self._getfloat("audio", "streaming_step_size", 0.2)
         self.update_interval = self._getfloat("audio", "update_interval", 0.5)
         self.streaming_overlap = self._getfloat("audio", "streaming_overlap", 0.3)
+        self.final_overlap_duration = self._getfloat("audio", "final_overlap_duration", 0.6)
         
         # Display settings
         self.display_duration = self._getfloat("display", "display_duration", 3.0)

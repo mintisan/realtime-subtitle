@@ -7,6 +7,7 @@ from PyQt6.QtCore import Qt, QSize, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QIcon, QColor
 import sys
 import sounddevice as sd
+from api_utils import normalize_openai_base_url
 from config import config
 
 # Modern QSS Styles
@@ -496,7 +497,7 @@ class Dashboard(QWidget):
             import httpx
             
             api_key = self.api_key.text() or "dummy-key-for-local"
-            base_url = self.base_url.text() or None
+            base_url = normalize_openai_base_url(self.base_url.text() or None)
             
             # Update button state
             self.refresh_models_btn.setEnabled(False)
@@ -639,6 +640,8 @@ class Dashboard(QWidget):
         # Check MPS + FunASR quantization compatibility
         if is_funasr:
             self._check_funasr_mps_compatibility()
+        elif backend == "whisper":
+            self._check_whisper_device_compatibility()
     
     def _check_funasr_mps_compatibility(self):
         """Check if MPS device is used with FunASR and enforce float32"""
@@ -666,12 +669,36 @@ class Dashboard(QWidget):
         )
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg.exec()
+
+    def _check_whisper_device_compatibility(self):
+        """faster-whisper supports CPU/CUDA, not Apple MPS."""
+        if self.device_type.currentText() != "mps":
+            return
+        
+        from PyQt6.QtWidgets import QMessageBox
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Device Compatibility")
+        msg.setText("faster-whisper does not support MPS")
+        msg.setInformativeText(
+            "The 'whisper' backend uses faster-whisper, which supports CPU/CUDA but not Apple's MPS backend.\n\n"
+            "The device has been switched to CPU.\n\n"
+            "If you want Apple Silicon GPU acceleration, choose the 'mlx' backend instead."
+        )
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
+        
+        cpu_index = self.device_type.findText("cpu")
+        if cpu_index >= 0:
+            self.device_type.setCurrentIndex(cpu_index)
     
     def _on_device_changed(self, device):
         """Check device compatibility when user changes device selection"""
         # Check MPS + FunASR quantization compatibility
         if self.asr_backend.currentText() == "funasr":
             self._check_funasr_mps_compatibility()
+        elif self.asr_backend.currentText() == "whisper":
+            self._check_whisper_device_compatibility()
     
     def _on_quantization_changed(self, quantization):
         """Check quantization compatibility when user changes quantization"""
@@ -768,7 +795,7 @@ class Dashboard(QWidget):
         
         # Translation
         cp.set("api", "api_key", self.api_key.text())
-        cp.set("api", "base_url", self.base_url.text())
+        cp.set("api", "base_url", normalize_openai_base_url(self.base_url.text()) or "")
         cp.set("translation", "model", self.model.currentText())
         cp.set("translation", "target_lang", self.target_lang.currentText())
         

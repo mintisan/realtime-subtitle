@@ -29,11 +29,24 @@ class Transcriber:
     def _init_whisper(self, model_size, device, compute_type):
         """Initialize faster-whisper backend"""
         from faster_whisper import WhisperModel
-        self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        print(f"[Transcriber] Using faster-whisper (CPU/CUDA) with model: {model_size}")
+        
+        # faster-whisper uses CTranslate2 and supports cpu/cuda, not Apple's MPS backend.
+        normalized_device = (device or "cpu").lower()
+        if normalized_device in ["mps", "metal", "auto"]:
+            print(
+                f"[Transcriber] faster-whisper does not support device='{device}', "
+                "falling back to CPU. Use backend='mlx' for Apple Silicon GPU acceleration."
+            )
+            normalized_device = "cpu"
+            if compute_type == "float16":
+                compute_type = "int8"
+        
+        self.device = normalized_device
+        self.compute_type = compute_type
+        self.model = WhisperModel(model_size, device=normalized_device, compute_type=compute_type)
+        print(f"[Transcriber] Using faster-whisper with model={model_size}, device={normalized_device}, compute_type={compute_type}")
     
     def _init_mlx(self, model_size):
-        sssss
         try:
             import mlx_whisper
             # MLX doesn't need explicit model loading here
@@ -435,8 +448,8 @@ class Transcriber:
         if norm_text == norm_prompt:
             return True
             
-        # Check if text is a trailing substring of prompt (e.g. Prompt="Hello world", Text="world")
-        if norm_prompt.endswith(norm_text):
+        # Only filter short suffix echoes so overlap-based chunking does not drop valid continuation.
+        if len(norm_text.split()) <= 4 and norm_prompt.endswith(norm_text):
             return True
             
         return False
@@ -567,7 +580,7 @@ class Transcriber:
         segments, _ = self.model.transcribe(
             audio_data, 
             language=self.language, 
-            beam_size=5,
+            beam_size=1,
             condition_on_previous_text=False, # We manage context manually if needed
             initial_prompt=prompt,
             no_speech_threshold=0.6

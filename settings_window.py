@@ -3,6 +3,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QLineEdit, QHBoxLayou
 from PyQt6.QtCore import Qt
 import configparser
 import os
+from api_utils import normalize_openai_base_url
 from config import config
 
 class SettingsWindow(QWidget):
@@ -129,7 +130,7 @@ class SettingsWindow(QWidget):
         from openai import OpenAI
         
         api_key = self.api_key_input.text() or "dummy"
-        base_url = self.base_url_input.text()
+        base_url = normalize_openai_base_url(self.base_url_input.text())
         
         if not base_url:
             QMessageBox.warning(self, "Missing URL", "Please enter an API Base URL first.")
@@ -202,7 +203,7 @@ class SettingsWindow(QWidget):
         if not parser.has_section("audio"): parser.add_section("audio")
         
         parser.set("api", "api_key", self.api_key_input.text() or "")
-        parser.set("api", "base_url", self.base_url_input.text() or "")
+        parser.set("api", "base_url", normalize_openai_base_url(self.base_url_input.text()) or "")
         parser.set("translation", "model", self.model_input.currentText())
         parser.set("translation", "threads", str(self.threads_input.value()))
         parser.set("transcription", "backend", self.backend_input.currentText())
