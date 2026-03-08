@@ -7,4 +7,5 @@ openai
 pyobjc-framework-CoreAudio; sys_platform == 'darwin'
 funasr
 modelscope
+torchaudio
 watchdog

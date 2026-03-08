@@ -1,3 +1,4 @@
+import re
 import numpy as np
 
 class Transcriber:
@@ -63,6 +64,8 @@ class Transcriber:
             import platform
             import torch
             
+            model_size = self._normalize_funasr_model_name(model_size)
+            self.model_size = model_size
             print(f"[Transcriber] Initializing FunASR with model: {model_size}")
             
             # Determine the optimal device for FunASR
@@ -83,7 +86,8 @@ class Transcriber:
                 "model": model_size,
                 "device": funasr_device,
                 "disable_pbar": True,
-                "disable_log": False
+                "disable_log": True,
+                "disable_update": True,
             }
             
             # For MPS device, we need to ensure float32 dtype
@@ -137,6 +141,16 @@ class Transcriber:
             print("[Transcriber] Falling back to faster-whisper")
             self.backend = "whisper"
             self._init_whisper("base", "cpu", "int8")
+
+    def _normalize_funasr_model_name(self, model_size):
+        """Map known aliases to model identifiers that AutoModel can resolve."""
+        aliases = {
+            "FunAudioLLM/SenseVoiceSmall": "iic/SenseVoiceSmall",
+        }
+        normalized = aliases.get(model_size, model_size)
+        if normalized != model_size:
+            print(f"[Transcriber] Remapped FunASR model '{model_size}' -> '{normalized}'")
+        return normalized
     
     def _apply_mps_float32_patches(self):
         """Apply patches to ensure float32 is used on MPS device"""
@@ -368,6 +382,8 @@ class Transcriber:
             text = self._transcribe_mlx(audio_data, prompt)
         else:  # whisper
             text = self._transcribe_faster_whisper(audio_data, prompt)
+        
+        text = self._clean_transcription_text(text)
             
         # Filter hallucinations (infinite loops, e.g. "once once once")
         if self._is_hallucination(text):
@@ -391,6 +407,20 @@ class Transcriber:
             print("[Transcriber] Warmup complete.")
         except Exception as e:
             print(f"[Transcriber] Warmup failed (non-fatal): {e}")
+
+    def _clean_transcription_text(self, text):
+        """Remove backend-specific control tokens and normalize whitespace."""
+        if not text:
+            return ""
+        
+        cleaned = text
+        
+        # SenseVoice/FunASR may emit control tokens like <|en|><|NEUTRAL|><|Speech|>.
+        cleaned = re.sub(r"<\|[^>]+?\|>", " ", cleaned)
+        
+        # Normalize whitespace introduced by token stripping.
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
 
     def _is_hallucination(self, text):
         """Check if text looks like a Whisper hallucination (repetitive loop)"""
