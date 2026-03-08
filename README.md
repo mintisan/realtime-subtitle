@@ -23,6 +23,7 @@ https://github.com/user-attachments/assets/9982fe5d-3937-42d5-bcfc-e23748c01edf
    - macOS (recommended for `mlx-whisper` support)
    - `ffmpeg` installed (e.g., `brew install ffmpeg`)
    - `BlackHole` installed (e.g., `brew install blackhole-2ch`, need to enter system password)
+   - Reboot macOS after installing `BlackHole` so the driver is visible to the app
    - `BlackHole` Settings![BlackHole Settings](demo/how_to_set_blackhole.png)
 
 2. **Install Dependencies**:
@@ -39,6 +40,12 @@ https://github.com/user-attachments/assets/9982fe5d-3937-42d5-bcfc-e23748c01edf
    **🖥 MacOS Users**:
    1. Use terminal to run `install_mac.sh`
 
+3. **Create Your Runtime Config**:
+   ```bash
+   cp config.ini.example config.ini
+   ```
+   `config.ini.example` is the reproducible baseline used by this project. Keep `config.ini` for machine-local overrides.
+
 ## ✨ New Features & Quick Start
 - **Modern Control Center**: Manage all settings in a dark-themed Dashboard.
 - **One-Click Launch**: Start the overlay translator directly from the Dashboard.
@@ -51,6 +58,12 @@ https://github.com/user-attachments/assets/9982fe5d-3937-42d5-bcfc-e23748c01edf
 Run the helper script for your OS:
 - **Mac/Linux**: `./start_mac.sh`
 - **Windows**: `start_windows.bat`
+
+### Recommended Presets
+- **Apple Silicon + English meetings/videos + lowest latency**: `backend = mlx`, `whisper_model = tiny.en`
+- **Apple Silicon + English meetings/videos + higher accuracy**: `backend = mlx`, `whisper_model = small.en`
+- **OpenAI-compatible local translation server (LM Studio / Ollama / vLLM)**: point `base_url` to the API root such as `http://host:1234/v1`, not `/v1/chat/completions`
+- **FunASR on Apple Silicon**: use `backend = funasr`, `device = mps`, `compute_type = float32`
 
 ### 2. The Dashboard
 The application opens the **Real-Time Translator Control Center**.
@@ -70,12 +83,13 @@ The application opens the **Real-Time Translator Control Center**.
   * <details>
      <summary>How to Set</summary>
      
-     * MacOS
+     * macOS
        * Whisper Model: base
-       * Compute Device: audo
+       * Compute Device: auto
        * Quantization: float16
    </details>
 - **Translation**: Set your OpenAI API Key and Target Language.
+- **Local LLM Translation**: For LM Studio, use the OpenAI-compatible API root such as `http://100.88.175.20:1234/v1` and set `api_key` to any non-empty value like `dummy-key-for-local`.
 - **Save Settings**: Click "Save Settings" to persist your configuration.
 
 ### 3. The Overlay
@@ -91,26 +105,42 @@ Settings are managed via the Dashboard, but stored in `config.ini`.
 #### `[api]` Section
 | Parameter | Description | Examples |
 | :--- | :--- | :--- |
-| `base_url` | API Endpoint | `https://api.openai.com/v1`, `http://localhost:11434/v1` |
+| `base_url` | API root endpoint | `https://api.openai.com/v1`, `http://localhost:11434/v1`, `http://100.88.175.20:1234/v1` |
 | `api_key` | Auth Key | `sk-...` (or `dummy` for local) |
+
+Note: `base_url` must be the API root. Do not use a full path such as `/v1/chat/completions`.
+
+#### `[translation]` Section
+| Parameter | Description | Examples |
+| :--- | :--- | :--- |
+| `model` | Translation model | `gpt-4o-mini`, `hy-mt1.5-1.8b` |
 | `target_lang` | Output Language | `Chinese`, `English`, `Japanese` |
+| `threads` | Translation worker count | `1`, `2` |
 
 #### `[transcription]` Section
 | Parameter | Description | Details |
 | :--- | :--- | :--- |
 | `backend` | ASR Engine | `whisper` (default), `mlx` (Apple Silicon), `funasr` (Alibaba) |
 | `whisper_model` | Whisper Model Size | `tiny` (fast), `large-v3` (accurate) |
-| `funasr_model` | FunASR Model Name | `paraformer-zh` (Chinese), `SenseVoiceSmall` (Multi-lang) |
-| `device` | Compute Unit | `auto` (Apple Neural Engine), `cuda` (NVIDIA) |
+| `funasr_model` | FunASR Model Name | `iic/SenseVoiceSmall`, `iic/speech_UniASR_asr_2pass-en-16k-common-vocab1080-tensorflow1-online` |
+| `device` | Compute Unit | `cpu`, `cuda`, `mps`, `auto` |
+
+Backend notes:
+- `whisper` uses `faster-whisper` and supports `cpu` / `cuda`. On macOS it will fall back to `cpu` if you choose `mps`.
+- `mlx` is the Apple Silicon accelerated Whisper backend and is the recommended choice for English meetings/news on M-series Macs.
+- `funasr + mps` requires `compute_type = float32` in this project.
 
 #### `[audio]` Section
 | Parameter | Description | Details |
 | :--- | :--- | :--- |
 | `silence_threshold`| Sensitivity | `0.005` (Quiet) to `0.05` (Loud) |
 | `device_index` | Mic ID | `auto` or specific index `0`, `1`... |
+| `final_overlap_duration` | Final chunk carry-over | `0.6` helps reduce dropped words at phrase boundaries |
 
 ## Troubleshooting
-- **No Audio?** Check the terminal for "Audio Capture" logs. If using BlackHole, ensure it's selected in `config.ini` or auto-detected.
+- **No Audio?** Check the terminal for "Audio Capture" logs. If using BlackHole, ensure macOS has been rebooted after installation and the device is selected or auto-detected.
+- **`BlackHole not found` in logs?** Reboot macOS after `brew install blackhole-2ch`, then reopen the app and re-check the Audio tab.
+- **Using a local OpenAI-compatible server?** If requests fail immediately, verify `base_url` points to `/v1` rather than `/v1/chat/completions`.
 - **Resize not working?** Use the designated "◢" handle in the bottom-right.
 - **Hot Reload**: Modify any `.py` file or save settings in the UI to trigger a reload.
 
@@ -131,6 +161,7 @@ FunASR is Alibaba's industrial-grade ASR toolkit with excellent Chinese language
 - **Latest 31-language model**: `FunAudioLLM/Fun-ASR-Nano-2512` (Supports dialects, accents, lyrics)
 
 **Note**: FunASR model names must include the namespace (e.g., `iic/` or `FunAudioLLM/`)
+**Apple Silicon Note**: `funasr` can run on `mps` in this project, but the first launch may download a large model from ModelScope and `SenseVoiceSmall` may be less accurate than `mlx` for English-only content.
 
 
 ## License: MIT
