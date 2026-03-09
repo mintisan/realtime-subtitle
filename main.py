@@ -29,6 +29,7 @@ class Pipeline(QObject):
         self.last_final_text = ""
         self.active_chunk_id = 1
         self.latest_partial_request = 0
+        self.translation_enabled = True
         
         # Print config for debugging
         config.print_config()
@@ -111,6 +112,11 @@ class Pipeline(QObject):
             self.thread.join(timeout=2)
         print("[Pipeline] Stopped.")
 
+    def set_translation_enabled(self, enabled):
+        with self.state_lock:
+            self.translation_enabled = enabled
+        print(f"[Pipeline] Translation {'enabled' if enabled else 'disabled'}")
+
     def processing_loop(self):
         """Fully parallel pipeline: multiple concurrent transcription + translation"""
         print("Pipeline processing loop started.")
@@ -130,7 +136,8 @@ class Pipeline(QObject):
         buffer = np.array([], dtype=np.float32)
         chunk_id = 1
         last_update_time = time.time()
-        phrase_start_time = time.time()
+        phrase_start_time = None
+        partial_updates_for_chunk = 0
         
         # Generator yielding small chunks (e.g. 0.2s)
         audio_gen = self.audio.generator()
@@ -144,16 +151,20 @@ class Pipeline(QObject):
                 buffer = np.concatenate([buffer, audio_chunk])
                 now = time.time()
                 buffer_duration = len(buffer) / self.audio.sample_rate
+                if phrase_start_time is None:
+                    phrase_start_time = now
+                chunk_wall_duration = now - phrase_start_time
                 
                 # Check silence for finalization
                 # Use configured silence duration/threshold
                 is_silence = False
-                min_silence_dur = config.silence_duration # e.g. 1.0s
+                min_silence_dur = max(config.silence_duration, 0.1)
                 
                 # Only check silence if we have enough buffer
                 if buffer_duration > min_silence_dur:
-                     # Check tail of silence duration
-                    tail = buffer[-int(self.audio.sample_rate * min_silence_dur):]
+                    # Check tail of silence duration
+                    tail_samples = int(self.audio.sample_rate * min_silence_dur)
+                    tail = buffer[-tail_samples:]
                     rms = np.sqrt(np.mean(tail**2))
                     if rms < self.audio.silence_threshold:
                         is_silence = True
@@ -164,7 +175,7 @@ class Pipeline(QObject):
                 
                 # 2. Soft Limit: > 6.0s duration AND > 0.4s silence (Catch brief pauses to avoid huge latency)
                 soft_limit_cut = False
-                if buffer_duration > 6.0:
+                if buffer_duration > 6.0 or chunk_wall_duration > 6.0:
                     # Check shorter silence tail (0.4s)
                     short_tail_samps = int(self.audio.sample_rate * 0.4)
                     if len(buffer) > short_tail_samps:
@@ -172,8 +183,14 @@ class Pipeline(QObject):
                         if t_rms < self.audio.silence_threshold:
                             soft_limit_cut = True
                             
-                # 3. Hard Limit: > max_phrase_duration (Force cut)
-                hard_limit_cut = (buffer_duration > self.audio.max_phrase_duration)
+                # 3. Hard Limit: > max_phrase_duration in audio length or wall clock time
+                hard_limit_cut = (
+                    buffer_duration > self.audio.max_phrase_duration
+                    or (
+                        buffer_duration > 2.0
+                        and chunk_wall_duration > (self.audio.max_phrase_duration + config.update_interval)
+                    )
+                )
 
                 should_finalize = standard_cut or soft_limit_cut or hard_limit_cut
                 
@@ -192,8 +209,23 @@ class Pipeline(QObject):
                     # (Prevent infinite loop of repeating prompt on empty audio)
                     overall_rms = np.sqrt(np.mean(final_buffer**2))
                     if overall_rms < self.audio.silence_threshold:
-                         print(f"[Pipeline] Skipped silent chunk {cid} (RMS={overall_rms:.4f})")
+                        print(
+                            f"[Pipeline] Skipped silent chunk {cid} "
+                            f"(RMS={overall_rms:.4f}, wall={chunk_wall_duration:.2f}s, buffer={buffer_duration:.2f}s)"
+                        )
                     else:
+                        reasons = []
+                        if standard_cut:
+                            reasons.append("silence")
+                        if soft_limit_cut:
+                            reasons.append("soft_limit")
+                        if hard_limit_cut:
+                            reasons.append("hard_limit")
+                        print(
+                            f"[Pipeline] Finalizing chunk {cid} "
+                            f"(reason={'+'.join(reasons)}, wall={chunk_wall_duration:.2f}s, "
+                            f"buffer={buffer_duration:.2f}s, partials={partial_updates_for_chunk})"
+                        )
                         # Submit Final Task
                         # Pass prompt AND translate_executor for async translation
                         final_executor.submit(self._process_final_chunk, final_buffer, cid, prompt, translate_executor)
@@ -201,10 +233,11 @@ class Pipeline(QObject):
                     # Reset
                     buffer = next_buffer
                     chunk_id += 1
+                    partial_updates_for_chunk = 0
                     with self.state_lock:
                         self.active_chunk_id = chunk_id
                         self.latest_partial_request += 1
-                    phrase_start_time = now
+                    phrase_start_time = now if len(next_buffer) > 0 else None
                     last_update_time = now
                     
                 # 2. Partial Update if: Interval passed AND not finalizing
@@ -220,6 +253,7 @@ class Pipeline(QObject):
                             self.active_chunk_id = chunk_id
                             self.latest_partial_request += 1
                             request_id = self.latest_partial_request
+                        partial_updates_for_chunk += 1
                         self.partial_future = partial_executor.submit(
                             self._process_partial_chunk, partial_buffer, chunk_id, prompt, request_id
                         )
@@ -257,12 +291,18 @@ class Pipeline(QObject):
                 # Save for context (only if meaningful)
                 if len(text.split()) > 2:
                     self.last_final_text = self._trim_prompt_context(text)
-                
+
+                with self.state_lock:
+                    translation_enabled = self.translation_enabled
+
                 # Emit final transcription first (confirms text)
-                self.signals.update_text.emit(chunk_id, text, "(translating...)")
-                
+                if translation_enabled:
+                    self.signals.update_text.emit(chunk_id, text, "(translating...)")
+                else:
+                    self.signals.update_text.emit(chunk_id, text, "")
+
                 # Offload translation to separate thread so we don't block next transcription
-                if translate_executor:
+                if translation_enabled and translate_executor:
                     translate_executor.submit(self._run_translation, text, chunk_id)
             else:
                 pass
@@ -271,12 +311,24 @@ class Pipeline(QObject):
 
     def _run_translation(self, text, chunk_id):
         """Run translation in background and emit result"""
+        started_at = time.time()
+        print(f"[Translation {chunk_id}] Started")
         try:
+            with self.state_lock:
+                if not self.translation_enabled:
+                    print(f"[Translation {chunk_id}] Skipped because translation is disabled")
+                    return
             translated = self.translator.translate(text)
-            print(f"[Final {chunk_id}] Translated: {translated}")
+            elapsed = time.time() - started_at
+            with self.state_lock:
+                if not self.translation_enabled:
+                    print(f"[Translation {chunk_id}] Dropped result because translation is disabled")
+                    return
+            print(f"[Final {chunk_id}] Translated in {elapsed:.2f}s: {translated}")
             self.signals.update_text.emit(chunk_id, text, translated)
         except Exception as e:
-            print(f"[Translation {chunk_id}] Failed: {e}")
+            elapsed = time.time() - started_at
+            print(f"[Translation {chunk_id}] Failed after {elapsed:.2f}s: {e}")
             self.signals.update_text.emit(chunk_id, text, "[Translation Failed]")
 
     def _trim_prompt_context(self, text, max_words=20):
@@ -318,7 +370,8 @@ def start_overlay_session():
     # Initialize Overlay Window
     window = OverlayWindow(
         display_duration=config.display_duration,
-        window_width=config.window_width
+        window_width=config.window_width,
+        window_height=config.window_height,
     )
     window.show()
     
@@ -327,6 +380,8 @@ def start_overlay_session():
     
     # Connect signals
     _pipeline.signals.update_text.connect(window.update_text)
+    if hasattr(window, "bilingual_toggled"):
+        window.bilingual_toggled.connect(_pipeline.set_translation_enabled)
     
     # Start pipeline
     _pipeline.start()

@@ -831,12 +831,15 @@ class Dashboard(QWidget):
         self.pipeline = pipeline
         self.overlay_window = OverlayWindow(
             display_duration=config.display_duration,
-            window_width=config.window_width
+            window_width=config.window_width,
+            window_height=config.window_height,
         )
         self.overlay_window.show()
 
         # Connect Signals
         self.pipeline.signals.update_text.connect(self.overlay_window.update_text)
+        if hasattr(self.overlay_window, "bilingual_toggled"):
+             self.overlay_window.bilingual_toggled.connect(self.pipeline.set_translation_enabled)
         if hasattr(self.overlay_window, 'stop_requested'):
              self.overlay_window.stop_requested.connect(self.on_stop)
 

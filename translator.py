@@ -2,6 +2,7 @@ from openai import OpenAI, OpenAIError
 import httpx
 import os
 import re
+import time
 from api_utils import normalize_openai_base_url
 
 class Translator:
@@ -27,9 +28,14 @@ class Translator:
             base_url = os.getenv("OPENAI_BASE_URL")
 
         self.base_url = normalize_openai_base_url(base_url)
+        self.request_timeout = httpx.Timeout(connect=3.0, read=12.0, write=12.0, pool=3.0)
         
-        # Create HTTP client with SSL verification disabled (for self-signed certs)
-        http_client = httpx.Client(verify=False)
+        # Create HTTP client with explicit timeouts so a stuck local server does not block the queue forever.
+        http_client = httpx.Client(
+            verify=False,
+            timeout=self.request_timeout,
+            limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+        )
         self.client = OpenAI(api_key=api_key, base_url=self.base_url, http_client=http_client)
         
         # Logging
@@ -56,6 +62,10 @@ class Translator:
         """
         if not text or not text.strip():
             return ""
+        
+        started_at = time.perf_counter()
+        preview = text.replace("\n", " ")[:80]
+        print(f"[Translator] Starting request ({len(text)} chars): {preview}")
 
         # Build context-aware prompt
         if use_context and self.previous_text:
@@ -86,24 +96,29 @@ class Translator:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": text}
                 ],
-                temperature=0.3,
-                max_tokens=500,  # Increased to handle thinking tokens
-                timeout=10.0     # 10s timeout to prevent hanging
+                temperature=0.1,
+                max_tokens=160,
+                timeout=self.request_timeout,
             )
-            raw_result = response.choices[0].message.content.strip()
+            raw_result = (response.choices[0].message.content or "").strip()
             # Strip thinking tags if present
             result = self._strip_thinking(raw_result)
+            elapsed = time.perf_counter() - started_at
+            print(f"[Translator] Completed in {elapsed:.2f}s")
             
             # Store for next translation context
-            self.previous_text = text
-            self.previous_translation = result
+            if result:
+                self.previous_text = text
+                self.previous_translation = result
             
             return result
         except OpenAIError as e:
-            print(f"Translation Error: {e}")
+            elapsed = time.perf_counter() - started_at
+            print(f"[Translator] OpenAIError after {elapsed:.2f}s: {e}")
             return f"[Error: {e}]"
         except Exception as e:
-            print(f"Unexpected Error: {e}")
+            elapsed = time.perf_counter() - started_at
+            print(f"[Translator] Unexpected error after {elapsed:.2f}s: {e}")
             return text
 
 if __name__ == "__main__":
